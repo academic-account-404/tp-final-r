@@ -1,0 +1,723 @@
+---
+title: "Régularité et fréquentation des trains Intercités en France : Une corrélation existe-t-elle ?"
+author: "Analyse statistique des données ouvertes SNCF"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: flatly
+    highlight: kate
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 5
+)
+library(tidyverse)
+library(janitor)
+library(stringi)
+library(scales)
+library(kableExtra)
+library(broom)
+
+# Helper : wraps long strings for ggplot titles / subtitles
+tw <- function(x, w = 90) stringr::str_wrap(x, width = w)
+```
+
+## 1 - Introduction et objectifs
+
+La ponctualité des trains est un enjeu central de la satisfaction des voyageurs et de la crédibilité du service public ferroviaire. 
+En France, la SNCF publie régulièrement des données ouvertes sur la régularité de ses liaisons Intercités ainsi que sur la 
+fréquentation de ses gares, offrant une opportunité d'analyse statistique approfondie.
+
+L'objectif principal de cette étude est de déterminer s'il existe une corrélation entre la fréquentation d'une gare de départ et le taux de régularité des liaisons qui en sont issues. Deux hypothèses peuvent en être formulées : d'un côté, les gares les plus fréquentées pourraient bénéficier d'investissements prioritaires favorisant une meilleure 
+ponctualité ; de l'autre, un trafic plus dense pourrait engendrer une saturation du réseau et dégrader la régularité.
+
+Afin de répondre à cette question, l'analyse s'articule en plusieurs étapes. Dans un premier temps, nous décrivons la 
+distribution et l'évolution temporelle de la fréquentation des gares françaises. Dans un second temps, nous étudions 
+la distribution des liaisons (voyage d'une gare de départ vers une gare d'arrivée), ainsi que les plus et les moins 
+performantes du réseau Intercité. Enfin, nous mobilisons un test de corrélation pour évaluer statistiquement l'existence 
+d'un lien entre ces deux dimensions.
+
+## 2 - Jeu de données
+
+Ce rapport s'appuie sur deux jeux de données officiels : d'une part, les [taux de régularité mensuels des liaisons Intercités](https://ressources.data.sncf.com/explore/dataset/regularite-mensuelle-intercites/information/), 
+qui mesurent la proportion de trains arrivant à destination avec moins de cinq minutes de retard ; d'autre part, les données de [fréquentation annuelle des gares](https://ressources.data.sncf.com/explore/dataset/frequentation-gares/information/), 
+recensant le nombre de voyageurs y ayant effectué un arrêt entre 2015 et 2024.
+
+Le premier jeu de données porte sur la régularité mensuelle des liaisons Intercités. Il recense, pour chaque couple gare de départ - gare d'arrivée et pour chaque mois, 
+les principaux indicateurs opérationnels : nombre de trains programmés, circulés et annulés, nombre de trains en retard, taux de 
+régularité, ainsi que le ratio de ponctualité (nombre de trains à l'heure pour un train en retard). Il couvre la période de 
+janvier 2014 à juillet 2025, pour un total de 5 609 observations.
+
+Le second jeu de données porte sur la fréquentation annuelle des gares de voyageurs. Chaque gare y est identifiée par son nom, 
+son code UIC (identifiant attribué par l'Union Internationale des Chemins de Fer, préfixé par 87 pour les gares du réseau 
+SNCF) ainsi que son code postal et sa direction régionale de rattachement. 
+Deux axes de segmentation sont également renseignés : une segmentation marketing et une segmentation DRG, issue du [Document de Référence des Gares](https://www.garesetconnexions.sncf/sites/default/files/2025-06/DRG-2026-Version-Saisine-clean_0.pdf), qui classe chaque gare selon son rayonnement géographique en trois catégories - A (intérêt national), B (intérêt régional) et C (intérêt local). Pour chaque gare et chaque année, on dispose du nombre total de voyageurs et de non-voyageurs ayant fréquenté l'établissement.
+
+Le réseau est organisé en [huit directions régionales](https://www.garesetconnexions.sncf/fr/notre-organisation-territoriale) : la Direction des Gares d'Île-de-France, la Direction des Grandes Gares Parisiennes, et six directions couvrant respectivement 
+les territoires Hauts-de-France et Normandie, Grand Est, Auvergne-Rhône-Alpes et Bourgogne-Franche-Comté, 
+Bretagne et Pays de la Loire et Centre-Val-de-Loire, Nouvelle-Aquitaine, et Occitanie et Provence-Alpes-Côte d'Azur.
+
+---
+
+### 2.1 - Traitement des données
+
+La jointure des deux sources repose sur le nom des gares, les codes UIC n'étant pas disponibles dans le jeu de données de régularité. 
+Or les deux fichiers emploient des conventions orthographiques différentes (accentuation, ponctuation, abréviations) rendant toute correspondance directe impossible. 
+Le nettoyage des données s'est déroulé en quatre étapes successives.
+
+**Étape 1 — Normalisation des noms de gares.** 
+Une fonction de normalisation est appliquée uniformément aux deux jeux de données. 
+Elle convertit chaque nom en majuscules, supprime les accents et caractères diacritiques via translittération Latin-ASCII, 
+remplace les espaces et apostrophes par des tirets, abrège `SAINT` en `ST`, et élimine les tirets redondants.
+
+```{r echo=FALSE}
+normalize_station <- function(x) {
+  x %>%
+    toupper() %>%
+    stringi::stri_trans_general("Latin-ASCII") %>%
+    str_replace_all(" - ", "-") %>%
+    str_replace_all("[' ]", "-") %>%
+    str_replace_all("\\bSAINT\\b", "ST") %>%
+    str_replace_all("-+", "-") %>%
+    str_trim()
+}
+```
+
+**Étape 2 — Nettoyage du jeu de fréquentation.**
+
+Certaines gares partagent plusieurs noms alternatifs séparés par une barre oblique 
+(ex. `Brive / Brive-la-Gaillarde`). Ces entrées sont éclatées en lignes distinctes via `separate_longer_delim()`, 
+puis agrégées par nom normalisé pour éviter les doublons. Les colonnes de fréquentation annuelle (2018–2024) sont 
+sommées au sein de chaque groupe, et la segmentation DRG de la première occurrence est conservée.
+
+```{r echo=FALSE}
+df_freq <- read.csv("./data/frequentation-gares.csv", sep=";", check.names=F) %>%
+  clean_names() %>%
+  separate_longer_delim(nom_de_la_gare, delim = "/") %>%
+  mutate(nom_de_la_gare = normalize_station(nom_de_la_gare)) %>%
+  group_by(nom_de_la_gare) %>%
+  summarise(
+    across(starts_with("total_voyageurs_"), ~ sum(.x, na.rm = TRUE)),
+    segment_drg = first(segmentation_drg)
+  ) %>%
+  rename_with(~ str_replace(.x, "^total_voyageurs_", "voyageurs_"),
+              starts_with("total_voyageurs_"))
+```
+
+**Étape 3 — Correction des cas résiduels.**
+
+Après normalisation automatique, un ensemble de 13 gares présentent encore une divergence entre les deux 
+fichiers (par exemple `ROUEN` dans les données de régularité face à `ROUEN-RIVE-DROITE` dans la fréquentation, ou `PARIS-VAUGIRARD` qui correspond en réalité à `PARIS-MONTPARNASSE`). 
+Ces cas sont traités manuellement via un dictionnaire de correspondance appliqué avec `recode()`.
+
+```{r echo=FALSE}
+mapping <- c(
+  "BRIVE"           = "BRIVE-LA-GAILLARDE",
+  "TOULOUSE"        = "TOULOUSE-MATABIAU",
+  "PARIS-NORD"      = "PARIS-GARE-DU-NORD",
+  "PARIS-BERCY"     = "PARIS-BERCY-BOURGOGNE-PAYS-D-AUVERGNE",
+  "LIMOGES"         = "LIMOGES-BENEDICTINS",
+  "NICE-VILLE"      = "NICE",
+  "BOULOGNE-VILLE"  = "BOULOGNE-SUR-MER",
+  "CHERBOURG"       = "CHERBOURG-EN-COTENTIN",
+  "ROUEN"           = "ROUEN-RIVE-DROITE",
+  "ST-GERVAIS"      = "ST-GERVAIS-LES-BAINS-LE-FAYET",
+  "LATOUR-DE-CAROL" = "LATOUR-DE-CAROL-ENVEITG",
+  "LYON"            = "LYON-PART-DIEU",
+  "PARIS-VAUGIRARD" = "PARIS-MONTPARNASSE"
+)
+
+df_reg <- read.csv("./data/regularite-mensuelle-intercites.csv", sep=";", check.names=F) %>%
+  clean_names() %>%
+  separate_longer_delim(c(depart, arrivee), delim = "/") %>%
+  mutate(across(c(depart, arrivee), normalize_station)) %>%
+  mutate(
+    depart  = recode(depart,  !!!mapping),
+    arrivee = recode(arrivee, !!!mapping)
+  )
+```
+
+**Étape 4 — Jointure finale.**
+
+Les taux de régularité sont moyennés par triplet `(départ, arrivée, date)` pour consolider les doublons éventuels, 
+puis joints à gauche avec les données de fréquentation sur le nom normalisé de la gare de départ. 
+Les observations sans segmentation DRG renseignée sont exclues, car elles correspondent à des gares non identifiables 
+ou hors périmètre.
+
+```{r echo=FALSE}
+analysis_df <- df_reg %>%
+  group_by(depart, arrivee, date) %>%
+  summarise(taux_reg = mean(taux_de_regularite, na.rm = TRUE), .groups = "drop") %>%
+  left_join(df_freq, by = c("depart" = "nom_de_la_gare")) %>%
+  filter(!is.na(segment_drg) & segment_drg != "")
+```
+
+---
+
+### 2.2 - Aperçu du jeu de données final
+
+```{r echo=FALSE, message=FALSE}
+analysis_df %>%
+  head(8) %>%
+  select(
+    Départ       = depart,
+    Arrivée      = arrivee,
+    Date         = date,
+    `Régularité` = taux_reg,
+    `Voy. 2023`  = voyageurs_2023,
+    `Voy. 2024`  = voyageurs_2024,
+    `Seg. DRG`   = segment_drg
+  ) %>%
+  mutate(
+    `Régularité` = scales::percent(`Régularité` / 100, accuracy = 0.1),
+    across(starts_with("Voy."), ~ scales::number(.x, big.mark = "\u202f"))
+  ) %>%
+  kbl(
+    align    = c("l", "l", "c", "r", "r", "r", "c"),
+    booktabs = TRUE
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 13
+  ) %>%
+  column_spec(1:2, bold = TRUE) %>%
+  column_spec(7, color = "white",
+              background = case_when(
+                analysis_df$segment_drg[1:8] == "A" ~ "#2c7bb6",
+                analysis_df$segment_drg[1:8] == "B" ~ "#74add1",
+                TRUE ~ "#abd9e9"
+              ))
+```
+
+---
+
+## 3 - Analyse des données
+
+### 3.1. Asymétrie de la fréquentation des gares avec une prédominance des petites gares
+
+**Objectif** : Ce graphique décrit la distribution de la fréquentation moyenne des gares sur la période 2018–2024. 
+Il permet de comprendre comment se répartit la fréquentation afin d'anticiper la présence de valeurs extrêmes susceptibles 
+d'influencer les résultats du test statistique avant d'analyser la corrélation avec le taux de 
+régularité.
+
+```{r echo=FALSE}
+df_voyageurs <- analysis_df %>%
+  group_by(depart) %>%
+  summarise(voyageurs_avg = mean(c(first(voyageurs_2018), first(voyageurs_2019),
+                                   first(voyageurs_2020), first(voyageurs_2021),
+                                   first(voyageurs_2022), first(voyageurs_2023),
+                                   first(voyageurs_2024)), na.rm = TRUE))
+
+mean_val <- mean(df_voyageurs$voyageurs_avg, na.rm = TRUE)
+
+ggplot(df_voyageurs, aes(x = voyageurs_avg)) +
+  geom_area(stat = "density", fill = "#077187", alpha = 0.4, color = "#074F57", linewidth = 0.8) +
+  geom_vline(xintercept = mean_val, color = "#074F57", linetype = "dotted", linewidth = 0.6) +
+  annotate("text",
+           x = mean_val + 5000000, y = Inf,
+           label = paste0("Moyenne : ", format(round(mean_val), big.mark = "\u202f")),
+           color = "#074F57", hjust = 0, vjust = 2, size = 3.5) +
+  scale_x_continuous(labels = function(x) format(x, big.mark = "\u202f", scientific = FALSE)) +
+  labs(
+    title    = tw("Densité de fréquentation des gares (2018–2024)"),
+    subtitle = tw("Densité estimée — moyenne annuelle par gare de départ"),
+    x = "Nombre moyen de voyageurs",
+    y = "Densité"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", margin = margin(b = 6)),
+    plot.subtitle = element_text(color = "grey50"),
+    plot.margin   = margin(t = 10, r = 20, b = 10, l = 10),
+    axis.title.x  = element_text(color = "grey50", margin = margin(t = 10)),
+    axis.title.y  = element_text(color = "grey50", margin = margin(r = 10)),
+    panel.grid.minor = element_blank()
+  )
+```
+
+**Analyse** : La distribution est fortement asymétrique à droite. La grande majorité des gares concentre un 
+nombre de voyageurs relativement faible, regroupées dans le pic initial situé bien en deçà de la moyenne de 11 833 286 voyageurs. 
+Cette moyenne est d'ailleurs peu représentative de la gare typique, tirée vers le haut par quelques gares à très fort trafic. 
+Les petits pics secondaires visibles entre 25 et 100 millions de voyageurs correspondent vraisemblablement à des gares 
+parisiennes ou des grands hubs régionaux, structurellement à part dans le réseau Intercités.
+
+**Limites** : La présence de valeurs extrêmes en queue de distribution (notamment la gare dépassant les 200 millions de voyageurs) 
+introduit une forte hétérogénéité dans le jeu de données.
+
+---
+
+### 3.2. Impact de la crise sanitaire 2020 et dynamique de reprise du trafic
+
+**Objectif** : Visualiser l'évolution temporelle de la fréquentation moyenne des gares entre 2018 et 2024, afin de 
+contextualiser les données de fréquentation utilisées dans l'analyse. Cette vue d'ensemble permet également d'identifier 
+des périodes atypiques susceptibles d'introduire des irrégularités dans les analyses et d'en biaiser les conclusions.
+
+```{r echo=FALSE}
+df_evolution <- analysis_df %>%
+  group_by(depart) %>%
+  summarise(across(starts_with("voyageurs_"), first)) %>%
+  summarise(across(starts_with("voyageurs_"), mean, na.rm = TRUE)) %>%
+  pivot_longer(cols = everything(),
+               names_to  = "annee",
+               values_to = "voyageurs_avg") %>%
+  mutate(annee = as.integer(gsub("voyageurs_", "", annee)))
+
+ggplot(df_evolution, aes(x = annee, y = voyageurs_avg)) +
+  geom_area(fill = "#077187", alpha = 0.4, color = "#074F57", linewidth = 0.8) +
+  geom_point(color = "#074F57", size = 3) +
+  scale_x_continuous(breaks = 2018:2024) +
+  scale_y_continuous(labels = function(x) format(x, big.mark = "\u202f", scientific = FALSE)) +
+  labs(
+    title    = tw("Variation annuelle de la fréquentation moyenne (2018–2024)"),
+    subtitle = tw("Moyenne annuelle calculée sur l'ensemble des gares de départ"),
+    x = "Année",
+    y = "Nombre moyen de voyageurs"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", margin = margin(b = 6)),
+    plot.subtitle = element_text(color = "grey50"),
+    plot.margin   = margin(t = 10, r = 20, b = 10, l = 10),
+    axis.title.x  = element_text(color = "grey50", margin = margin(t = 10)),
+    axis.title.y  = element_text(color = "grey50", margin = margin(r = 10)),
+    panel.grid.minor = element_blank()
+  )
+```
+
+**Analyse** : La fréquentation est relativement stable entre 2018 (~12,7M) et 2019 (~12,8M), avant de chuter brutalement en 
+2020 (~7,5M) sous l'effet de la crise sanitaire du Covid-19. La reprise est progressive en 2021 (~9,3M), puis s'accélère à 
+partir de 2022 pour retrouver et dépasser le niveau pré-pandémique dès 2023. En 2024, la fréquentation atteint son 
+niveau le plus élevé de la période (~14,7M), témoignant d'un dynamisme du trafic ferroviaire.
+
+**Limites** : Cette courbe représente une moyenne sur l'ensemble des gares, ce qui lisse les disparités entre 
+gares très fréquentées et gares à faible trafic. Par ailleurs, l'année 2020 constitue un point atypique qui peut 
+biaiser les moyennes calculées sur l'ensemble de la période.
+
+---
+
+### 3.3. Hyper-concentration du trafic autour des hubs parisiens
+
+**Objectif** : Identifier les gares les plus fréquentées sur la période 2018-2024, afin de mettre en évidence 
+la concentration du trafic ferroviaire et d'évaluer le poids de ces gares dans l'analyse.
+
+```{r echo=FALSE}
+df_top10 <- analysis_df %>%
+  group_by(depart) %>%
+  summarise(voyageurs_avg = mean(c(first(voyageurs_2018), first(voyageurs_2019),
+                                   first(voyageurs_2020), first(voyageurs_2021),
+                                   first(voyageurs_2022), first(voyageurs_2023),
+                                   first(voyageurs_2024)), na.rm = TRUE)) %>%
+  arrange(desc(voyageurs_avg)) %>%
+  mutate(
+    total     = sum(voyageurs_avg),
+    pct       = voyageurs_avg / total * 100,
+    top10_pct = sum(pct[1:10])
+  ) %>%
+  slice_head(n = 10) %>%
+  mutate(depart = reorder(depart, voyageurs_avg))
+
+top10_share <- round(df_top10$top10_pct[1], 1)
+
+ggplot(df_top10, aes(x = depart, y = voyageurs_avg)) +
+  geom_col(fill = "#077187", alpha = 0.85, width = 0.7) +
+  geom_text(aes(label = paste0(round(pct, 1), "%")),
+            hjust = -0.15, color = "#074F57", size = 3.5, fontface = "bold") +
+  coord_flip() +
+  scale_y_continuous(
+    labels = function(x) format(x, big.mark = "\u202f", scientific = FALSE),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title    = tw("Hiérarchie des pôles d'affluence du réseau Intercités (2018–2024)"),
+    subtitle = tw(paste0("Ces 10 gares représentent ", top10_share, "% du trafic total")),
+    x = NULL,
+    y = "Nombre moyen de voyageurs"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", margin = margin(b = 6)),
+    plot.subtitle = element_text(color = "grey50"),
+    plot.margin   = margin(t = 10, r = 20, b = 10, l = 10),
+    axis.title.x  = element_text(color = "grey50", margin = margin(t = 10)),
+    axis.title.y  = element_text(color = "grey50", margin = margin(r = 10)),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
+```
+
+**Analyse** : Le trafic est extrêmement concentré. Les 10 gares les plus fréquentées représentent à elles seules 
+87,6% du trafic total. Paris-Gare-du-Nord domine avec 34,6% du trafic, suivie de Paris-St-Lazare (18,3%) et 
+Paris-Montparnasse (9,5%). Les quatre premières gares sont toutes parisiennes, ce qui souligne la centralité de 
+la capitale dans le réseau Intercités. La première gare non parisienne, Lyon-Part-Dieu, n'apparaît qu'en cinquième 
+position avec 5,7% de trafic.
+
+**Limites** : La domination écrasante des grandes gares parisiennes introduit un déséquilibre structurel dans le jeu de 
+données. Ces gares, de par leur taille et leur statut, ont potentiellement un profil de régularité très différent des gares 
+régionales ou locales, ce qui peut influencer la corrélation globale. Par ailleurs, certaines gares peuvent être absentes 
+du classement faute de données complètes sur l'ensemble de la période.
+
+---
+
+### 3.4. Analyse de la ponctualité globale
+
+**Objectif** : Visualiser la distribution du taux de régularité sur l'ensemble des liaisons Intercités, 
+afin de comprendre comment se répartit la ponctualité à travers le réseau et d'identifier d'éventuelles valeurs 
+extrêmes avant l'analyse de corrélation avec la fréquentation.
+
+```{r echo=FALSE}
+mean_val <- mean(analysis_df$taux_reg, na.rm = TRUE)
+
+ggplot(analysis_df, aes(x = taux_reg)) +
+  geom_area(stat = "density", fill = "#077187", alpha = 0.4, color = "#074F57", linewidth = 0.8) +
+  geom_vline(xintercept = mean_val, color = "#074F57", linetype = "dotted", linewidth = 0.6) +
+  annotate("text",
+           x = mean_val - 16, y = Inf,
+           label = paste0("Moyenne : ", round(mean_val, 1), "%"),
+           color = "#074F57", hjust = 0, vjust = 2, size = 3.5) +
+  scale_x_continuous(labels = function(x) paste0(x, "%")) +
+  labs(
+    title    = tw("Répartition statistique des taux de ponctualité"),
+    subtitle = tw("Densité estimée sur l'ensemble des liaisons"),
+    x = "Taux de régularité",
+    y = "Densité"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", margin = margin(b = 6)),
+    plot.subtitle = element_text(color = "grey50"),
+    plot.margin   = margin(t = 10, r = 20, b = 10, l = 10),
+    axis.title.x  = element_text(color = "grey50", margin = margin(t = 10)),
+    axis.title.y  = element_text(color = "grey50", margin = margin(r = 10)),
+    panel.grid.minor = element_blank()
+  )
+```
+
+**Analyse** : La distribution est asymétrique à gauche, avec un pic dominant autour de 85–90%, 
+légèrement au-dessus de la moyenne de 79,6%. On observe néanmoins une queue gauche notable avec plusieurs 
+petits pics secondaires autour de 20–25%, 50% et 70%, suggérant l'existence d'un sous-ensemble de liaisons moins ponctuelles. 
+Ces valeurs extrêmes basses sont peu nombreuses mais bien présentes, et contrastent fortement avec le comportement 
+majoritaire du réseau.
+
+**Limites** : Le taux de régularité utilisé est une moyenne calculée sur l'ensemble de la période 2014–2025, 
+ce qui peut masquer des variations temporelles importantes (notamment la dégradation ou l'amélioration de 
+certaines liaisons au fil des années). Par ailleurs, les petits pics visibles en queue gauche peuvent correspondre 
+à des liaisons très peu fréquentes dont la moyenne est calculée sur un faible nombre d'observations, 
+les rendant peu représentatives et potentiellement trompeuses dans l'analyse globale.
+
+---
+
+### 3.5. Suivi chronologique de la performance du réseau
+
+**Objectif** : Visualiser l'évolution mensuelle du taux de régularité moyen sur l'ensemble des liaisons 
+Intercités entre 2018 et 2024, afin d'identifier d'éventuelles tendances structurelles, 
+des ruptures temporelles ou des effets saisonniers susceptibles de contextualiser l'analyse de corrélation avec la fréquentation.
+
+```{r echo=FALSE}
+df_evolution_reg <- analysis_df %>%
+  mutate(date = as.Date(paste0(date, "-01"))) %>%
+  filter(between(year(date), 2018, 2024)) %>%
+  group_by(date) %>%
+  summarise(taux_reg_avg = mean(taux_reg, na.rm = TRUE), .groups = "drop")
+
+ggplot(df_evolution_reg, aes(x = date, y = taux_reg_avg)) +
+  geom_area(fill = "#077187", alpha = 0.4, color = "#074F57", linewidth = 0.8) +
+  geom_point(color = "#074F57", size = 2) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    limits = c(0, 100)
+  ) +
+  labs(
+    title    = tw("Évolution du taux de régularité moyen (2018–2024)"),
+    subtitle = tw("Moyenne mensuelle calculée sur l'ensemble des liaisons Intercités"),
+    x = "Date",
+    y = "Taux de régularité moyen"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", margin = margin(b = 6)),
+    plot.subtitle = element_text(color = "grey50"),
+    plot.margin   = margin(t = 10, r = 20, b = 10, l = 10),
+    axis.title.x  = element_text(color = "grey50", margin = margin(t = 10)),
+    axis.title.y  = element_text(color = "grey50", margin = margin(r = 10)),
+    panel.grid.minor = element_blank()
+  )
+```
+
+**Analyse** : Le taux de régularité moyen oscille globalement entre 75% et 90% sur la période, 
+témoignant d'une relative stabilité du réseau Intercités. On observe une saisonnalité récurrente, 
+avec des creux réguliers qui pourraient correspondre aux périodes de forte affluence hivernale ou aux 
+travaux de maintenance estivaux. Deux épisodes de dégradation marquée se distinguent nettement : le premier en début 2021, 
+où le taux chute autour de 60-65%, vraisemblablement lié aux perturbations résiduelles de la crise Covid-19 et aux grèves ; 
+le second en 2023, avec un creux similaire autour de 62-65%, possiblement associé à des mouvements sociaux ou à des incidents 
+d'infrastructure.
+
+**Limites** : La moyenne mensuelle agrège l'ensemble des liaisons sans pondération par 
+le nombre de trains circulés, ce qui donne le même poids à une liaison très fréquente et à une liaison marginale. 
+Enfin, ce graphique ne permet pas de distinguer si les dégradations observées sont généralisées à l'ensemble du réseau ou 
+concentrées sur quelques liaisons particulières.
+
+---
+
+### 3.6. Top 10 des liaisons les plus régulières
+
+**Objectif** : Identifier les liaisons affichant les meilleurs taux de régularité sur l'ensemble de la période, 
+afin de caractériser les routes les plus performantes du réseau Intercités et d'examiner si elles correspondent 
+à des gares de départ fortement ou faiblement fréquentées.
+
+```{r echo=FALSE}
+df_reg_liaison <- analysis_df %>%
+  group_by(depart, arrivee) %>%
+  summarise(taux_reg = mean(taux_reg, na.rm = TRUE), .groups = "drop") %>%
+  mutate(liaison = paste0(depart, " → ", arrivee))
+
+# Top 10
+df_top10_reg <- df_reg_liaison %>%
+  arrange(desc(taux_reg)) %>%
+  slice_head(n = 10) %>%
+  mutate(liaison = reorder(liaison, taux_reg))
+
+ggplot(df_top10_reg, aes(x = liaison, y = taux_reg)) +
+  geom_col(fill = "#077187", alpha = 0.85, width = 0.7) +
+  geom_text(aes(label = paste0(format(round(taux_reg, 1), nsmall = 1), "%")),
+            hjust = -0.15, color = "#074F57", size = 3.5, fontface = "bold") +
+  coord_flip() +
+  scale_y_continuous(
+    limits = c(0, 105),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    title    = tw("Top 10 des liaisons les plus régulières"),
+    subtitle = tw("Classement par taux de régularité moyen sur l'ensemble de la période"),
+    x = NULL,
+    y = "Taux de régularité (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", margin = margin(b = 6)),
+    plot.subtitle = element_text(color = "grey50"),
+    plot.margin   = margin(t = 10, r = 20, b = 10, l = 10),
+    axis.title.x  = element_text(color = "grey50", margin = margin(t = 10)),
+    axis.title.y  = element_text(color = "grey50", margin = margin(r = 10)),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
+```
+
+**Analyse** : Les taux de régularité du top 10 sont très resserrés, compris entre 89,9% et 94,0%. 
+La liaison Béziers → Clermont-Ferrand arrive en tête avec 93,96%, suivie de près par Tarbes → Paris-Austerlitz (93,78%) et 
+Clermont-Ferrand → Béziers (93,66%). On notera que ces deux dernières liaisons sont en réalité le trajet aller-retour 
+d'une même route, ce qui confirme la robustesse de cette performance. Le classement mêle des liaisons 
+régionales (Béziers, Tarbes, Granville, Belfort) et des axes vers Paris, sans qu'un profil unique ne se dégage clairement.
+
+**Limites** : Ce classement est basé sur une moyenne calculée sur l'ensemble de la période disponible, 
+sans pondération par le nombre de trains ou d'observations. Une liaison peu fréquente avec seulement quelques mois 
+de données peut ainsi afficher un taux artificiellement élevé. Par ailleurs, la présence 
+simultanée de Béziers → Clermont-Ferrand et Clermont-Ferrand → Béziers illustre le fait que les 
+liaisons aller et retour sont traitées indépendamment, ce qui peut gonfler artificiellement la représentation de 
+certaines routes dans le classement.
+
+---
+
+### 3.7. Top 10 des liaisons les moins régulières
+
+**Objectif** : Identifier les liaisons affichant les taux de régularité les plus faibles, afin de repérer 
+les routes les plus problématiques du réseau et d'examiner si leur mauvaise performance est associée à 
+un niveau de fréquentation particulier.
+
+```{r echo=FALSE}
+df_bot10_reg <- df_reg_liaison %>%
+  arrange(taux_reg) %>%
+  slice_head(n = 10) %>%
+  mutate(liaison = reorder(liaison, taux_reg))
+
+ggplot(df_bot10_reg, aes(x = liaison, y = taux_reg)) +
+  geom_col(fill = "#077187", alpha = 0.85, width = 0.7) +
+  geom_text(aes(label = paste0(format(round(taux_reg, 1), nsmall = 1), "%")),
+            hjust = -0.15, color = "#074F57", size = 3.5, fontface = "bold") +
+  coord_flip() +
+  scale_y_continuous(
+    limits = c(0, 105),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  labs(
+    title    = tw("Top 10 des liaisons les moins régulières"),
+    subtitle = tw("Classement par taux de régularité moyen sur l'ensemble de la période"),
+    x = NULL,
+    y = "Taux de régularité (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", margin = margin(b = 6)),
+    plot.subtitle = element_text(color = "grey50"),
+    plot.margin   = margin(t = 10, r = 20, b = 10, l = 10),
+    axis.title.x  = element_text(color = "grey50", margin = margin(t = 10)),
+    axis.title.y  = element_text(color = "grey50", margin = margin(r = 10)),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
+```
+
+**Analyse** : Le classement révèle deux groupes bien distincts. Un premier groupe de six liaisons affiche des 
+taux compris entre 51,3% et 65,2%, avec une présence marquée de Paris-Austerlitz comme gare de départ ou d'arrivée (ce qui 
+suggère des difficultés structurelles sur cet axe.) Un second groupe de quatre liaisons, en bas du classement, 
+affiche des taux particulièrement bas entre 16,5% et 17,1%, impliquant les liaisons vers et depuis St-Gervais-les-Bains-le-Fayet et 
+Bourg-St-Maurice. Ces valeurs extrêmes sont vraisemblablement liées à un très faible nombre d'observations et 
+doivent être interprétées avec précaution.
+
+**Limites** : La présence simultanée des liaisons aller-retour 
+(Paris-Austerlitz → St-Gervais et St-Gervais → Paris-Austerlitz) confirme que ces routes sont traitées indépendamment, 
+ce qui double artificiellement leur représentation dans le classement. 
+Plus fondamentalement, un taux de régularité calculé sur seulement quelques occurrences n'est pas statistiquement 
+représentatif et peut résulter d'incidents ponctuels plutôt que d'une tendance de fond. Un filtre sur un nombre 
+minimum d'observations serait nécessaire pour rendre ce classement pleinement fiable. Il convient également de noter que 
+la gare "BOURG-ST-MAURICE/ST-GERVAIS", initialement renseignée comme une seule entité dans le jeu de données brut, a été 
+scindée en deux gares distinctes lors de la phase de normalisation. Cette séparation artificielle peut conduire à des taux 
+de régularité peu fiables pour ces liaisons.
+
+---
+
+### 3.8. Relation entre volume de voyageurs et ponctualité
+
+**Objectif** : Visualiser graphiquement la relation entre la fréquentation moyenne d'une gare de départ et le 
+taux de régularité des liaisons qui en sont issues, afin d'apporter un support visuel au test de corrélation réalisé en conclusion.
+
+```{r echo=FALSE}
+df_corr <- analysis_df %>%
+  group_by(depart, arrivee) %>%
+  summarise(
+    taux_reg      = mean(taux_reg, na.rm = TRUE),
+    voyageurs_avg = mean(c(first(voyageurs_2018), first(voyageurs_2019),
+                           first(voyageurs_2020), first(voyageurs_2021),
+                           first(voyageurs_2022), first(voyageurs_2023),
+                           first(voyageurs_2024)), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(df_corr, aes(x = voyageurs_avg, y = taux_reg)) +
+  geom_point(color = "#077187", alpha = 0.7, size = 3) +
+  geom_smooth(method = "lm", color = "#074F57", fill = "#077187",
+              alpha = 0.15, linewidth = 0.8) +
+  scale_x_continuous(labels = function(x) format(x, big.mark = "\u202f", scientific = FALSE)) +
+  labs(
+    title    = tw("Relation entre fréquentation de la gare de départ et taux de régularité"),
+    subtitle = tw("Chaque point représente une liaison — droite de régression linéaire en fond"),
+    x = "Nombre moyen de voyageurs de la gare de départ (2018–2024)",
+    y = "Taux de régularité (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", margin = margin(b = 6)),
+    plot.subtitle = element_text(color = "grey50"),
+    plot.margin   = margin(t = 10, r = 20, b = 10, l = 10),
+    axis.title.x  = element_text(color = "grey50", margin = margin(t = 10)),
+    axis.title.y  = element_text(color = "grey50", margin = margin(r = 10)),
+    panel.grid.minor = element_blank()
+  )
+```
+
+**Analyse** : Le nuage de points ne révèle aucune tendance claire. La droite de régression linéaire est quasi horizontale, semblant montrer l'absence de relation entre les deux variables. La majorité des liaisons se concentre dans la zone de faible fréquentation (moins de 50 millions de voyageurs), avec des taux de régularité dispersés entre 55% et 95%. Les quelques points correspondant aux gares les plus fréquentées (autour de 200 millions) affichent des taux de régularité dans la moyenne, sans se démarquer particulièrement. L'intervalle de confiance très large en queue de distribution illustre l'incertitude croissante du modèle linéaire là où les données sont rares.
+
+**Limites** : La régression linéaire est sensible aux valeurs extrêmes, et les deux points aberrants visibles en bas à gauche (taux autour de 15–17%) exercent une influence disproportionnée sur l'ajustement du modèle. Par ailleurs, la forte concentration des points dans la zone de faible fréquentation crée un déséquilibre qui rend la comparaison avec les gares à très fort trafic peu robuste. Enfin, ce graphique ne capture qu'une relation bivariée : d'autres facteurs non modélisés ici (comme le type de liaison, la longueur du trajet ou les conditions météorologiques) pourraient expliquer une partie de la variabilité observée dans le taux de régularité.
+
+---
+
+### 3.9. Évolution du coefficient de corrélation mensuel
+
+**Objectif** : Visualiser l'évolution mensuelle du coefficient de corrélation entre le taux de régularité des liaisons et la fréquentation de leur gare de départ, afin de déterminer si la relation entre ces deux variables se renforce, s'affaiblit ou s'inverse au fil du temps.
+
+```{r echo=FALSE}
+df_corr_evol <- map_dfr(2018:2024, function(yr) {
+  col <- paste0("voyageurs_", yr)
+
+  analysis_df %>%
+    mutate(date = as.Date(paste0(date, "-01"))) %>%
+    filter(year(date) == yr) %>%
+    group_by(depart) %>%
+    mutate(voyageurs = .data[[col]]) %>%
+    ungroup() %>%
+    group_by(date) %>%
+    summarise(
+      tau = cor(voyageurs, taux_reg, method = "kendall", use = "complete.obs"),
+      .groups = "drop"
+    )
+})
+
+ggplot(df_corr_evol, aes(x = date, y = tau)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60", linewidth = 0.6) +
+  geom_area(fill = "#077187", alpha = 0.4, color = "#074F57", linewidth = 0.8) +
+  geom_point(color = "#074F57", size = 2) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  scale_y_continuous(limits = c(-1, 1)) +
+  labs(
+    title    = tw("Évolution du coefficient de corrélation de Kendall mensuel (2018–2024)"),
+    subtitle = tw("Entre le taux de régularité et la fréquentation de la gare de départ"),
+    x = "Date",
+    y = "τ de Kendall"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", margin = margin(b = 6)),
+    plot.subtitle = element_text(color = "grey50"),
+    plot.margin   = margin(t = 10, r = 20, b = 10, l = 10),
+    axis.title.x  = element_text(color = "grey50", margin = margin(t = 10)),
+    axis.title.y  = element_text(color = "grey50", margin = margin(r = 10)),
+    panel.grid.minor = element_blank()
+  )
+```
+
+**Analyse** : Le coefficient $\tau$ oscille continûment autour de zéro sur l'ensemble de la période, confirmant l'absence de corrélation stable entre fréquentation et régularité. La majorité des valeurs mensuelles se situent dans la plage [-0.3, +0.1], avec une légère dominante négative — suggérant que, lorsqu'une tendance existe, elle va plutôt dans le sens d'une régularité légèrement moindre pour les gares les plus fréquentées, mais de façon trop faible pour être concluante. Deux épisodes se distinguent néanmoins : une hausse marquée du $\tau$ autour de 2020, atteignant +0.4, qui pourrait s'expliquer par la perturbation de la structure habituelle du trafic durant la crise Covid — les liaisons des grandes gares étant peut-être plus maintenues que celles des petites gares ; et une volatilité accrue entre 2020 et 2022, période de reprise progressive et irrégulière.
+
+**Limites** : Le coefficient est calculé chaque mois sur un nombre limité de liaisons actives, ce qui le rend très sensible aux valeurs extrêmes et peu robuste statistiquement. Les fortes variations d'un mois à l'autre reflètent davantage cette instabilité que de véritables changements structurels dans la relation entre les variables. Enfin, ce graphique mélange deux granularités temporelles différentes : le taux de régularité est mesuré au mois, tandis que la fréquentation est disponible à l'année seulement.
+
+---
+
+# Conclusion et limites
+
+Nous souhaitons vérifier statistiquement s'il existe une corrélation entre le nombre de voyageurs et la régularité des liaisons. Pour cela, nous étudions les variables continues `voyageurs_avg` et `taux_reg`. Sachant que nous avons des valeurs extrêmes, le test de Pearson promet des résultats peu fiables. À la place, nous allons utiliser le test de *corrélation de Kendall*.
+
+$$H_0 : \tau = 0 \quad \text{(aucune corrélation)}$$
+$$H_1 : \tau \ne 0 \quad \text{(il existe une relation monotone entre les deux variables)}$$
+
+```{r echo=FALSE}
+kendall_test <- cor.test(df_corr$voyageurs_avg, df_corr$taux_reg, method = "kendall")
+tau_val  <- round(kendall_test$estimate, 3)
+pval     <- round(kendall_test$p.value, 3)
+z_val    <- round(kendall_test$statistic, 3)
+
+broom::tidy(kendall_test) %>%
+  select(
+    `τ de Kendall`  = estimate,
+    `Statistique z` = statistic,
+    `p-value`       = p.value,
+    Méthode         = method
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  kbl(align = "c", booktabs = TRUE) %>%
+  kable_styling(
+    bootstrap_options = c("condensed", "hover"),
+    full_width = FALSE,
+    font_size  = 13
+  )
+```
+
+La corrélation est quasi nulle ($\tau =$ `r tau_val`), indiquant qu'il n'existe pratiquement pas de relation monotone entre les deux variables. Par ailleurs, une p-value de `r pval`, bien au-dessus du seuil conventionnel de 0.05, signifie qu'on ne peut pas rejeter $H_0$. Les données sont ainsi compatibles avec une **absence totale de corrélation** entre le taux de régularité des trains et la fréquentation de leur gare de départ.
+
+---
+
+**Limites méthodologiques** : L'analyse repose sur une jointure entre deux jeux de données aux granularités différentes : la régularité est mesurée à l'échelle de la liaison (depart-arrivee), tandis que la fréquentation est rattachée à la gare de départ uniquement. Cette asymétrie implique qu'une même valeur de `voyageurs_avg` est partagée par toutes les liaisons issues d'une même gare.
+
+**Biais dans les données** : Plusieurs sources de biais ont été identifiées tout au long de l'analyse. La présence de valeurs extrêmes dans le taux de régularité (notamment les liaisons vers St-Gervais et Bourg-St-Maurice, issues d'une séparation artificielle d'une gare initialement fusionnée) introduit un bruit susceptible de perturber les résultats. De même, l'inclusion des années 2020 et 2021, marquées par la crise sanitaire du Covid-19, a pu déformer les moyennes de fréquentation sans nécessairement impacter le taux de régularité de la même manière.
+
+**Axes d'amélioration** : Plusieurs pistes permettraient d'affiner l'analyse : filtrer les liaisons disposant d'un nombre minimum d'observations pour écarter les taux peu représentatifs ; reconduire le test en excluant les années Covid ; intégrer des variables de contrôle supplémentaires telles que la longueur des trajets, le segment DRG ou le nombre de trains programmés ; et enfin, travailler à une granularité mensuelle plutôt qu'agrégée, afin de capter des dynamiques temporelles que la moyenne efface.
+
+---
+
+*Projet de R - DO3 - 2025/2026 - Bassier Eliott, Lahya Nadia, Latmi Jessy, Lewis Charlotte*
